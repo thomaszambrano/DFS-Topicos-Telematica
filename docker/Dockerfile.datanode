@@ -1,0 +1,29 @@
+# Construcción multietapa: el binario se compila en una imagen con el compilador de
+# Go y se copia a una imagen mínima. La imagen final no lleva compilador ni código
+# fuente, así que es pequeña y tiene mucha menos superficie que atacar.
+FROM golang:1.27-alpine AS build
+
+WORKDIR /src
+# Las dependencias se copian y descargan antes del código: mientras go.mod no
+# cambie, Docker reutiliza esta capa y no vuelve a descargar nada.
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+# CGO_ENABLED=0 produce un binario estático, que corre en la imagen final sin
+# necesitar bibliotecas del sistema.
+RUN CGO_ENABLED=0 go build -trimpath -o /out/datanode ./cmd/datanode
+
+# Alpine y no scratch a propósito: la evidencia del hito (E.2.3) requiere entrar al
+# contenedor con `docker compose exec` y listar los chunks del volumen, y para eso
+# hace falta una shell.
+FROM alpine:3.21
+
+RUN adduser -D -u 10001 dfsha
+COPY --from=build /out/datanode /usr/local/bin/datanode
+
+RUN mkdir -p /data && chown dfsha:dfsha /data
+VOLUME ["/data"]
+USER dfsha
+
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/datanode"]

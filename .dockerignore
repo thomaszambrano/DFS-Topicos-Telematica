@@ -1,0 +1,8 @@
+.git
+.kiro
+data
+client/**/__pycache__
+*.pdf
+*.md
+!go.mod
+docker-compose.yml

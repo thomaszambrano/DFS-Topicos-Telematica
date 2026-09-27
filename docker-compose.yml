@@ -1,0 +1,116 @@
+# Despliegue reproducible del Hito 2: 1 ControlNode y 4 DataNodes.
+#
+# Cuatro DataNodes y no dos porque el enunciado exige un clúster de 3 a 4 nodos
+# (RX-06) y porque con cuatro la evidencia del reparto es visible: cada volumen debe
+# terminar con chunks distintos (E.2.3, RX-11, RX-12).
+
+name: dfsha
+
+services:
+  controlnode:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.controlnode
+    container_name: dfsha-controlnode
+    ports:
+      - "8080:8080"   # REST para el cliente
+      - "9090:9090"   # gRPC para los heartbeats
+    environment:
+      HTTP_ADDR: ":8080"
+      GRPC_ADDR: ":9090"
+
+      # 4 MB en lugar de 64 MB PARA LA DEMOSTRACIÓN. RT-01 exige que el tamaño sea
+      # configurable, y con 64 MB habría que subir más de 192 MB para que los cuatro
+      # volúmenes tuvieran chunks. Con 4 MB, un archivo de 40 MB produce 10 chunks
+      # repartidos entre los 4 nodos y la evidencia se ve de inmediato.
+      # En producción se deja el valor por omisión de 64 MB.
+      CHUNK_SIZE: "4194304"
+
+      # R=1: este hito no tiene replicación. Se lee del entorno porque RX-07 exige
+      # que el factor sea configurable y el Hito 3 solo tendrá que cambiar este valor.
+      REPLICATION_FACTOR: "1"
+
+      SUSPECT_AFTER: "9s"
+      DEAD_AFTER: "30s"
+      HEARTBEAT_INTERVAL: "3s"
+      LEASE_TTL: "2m"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  datanode1: &datanode
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.datanode
+    container_name: dfsha-datanode1
+    depends_on:
+      controlnode:
+        condition: service_started
+    ports:
+      - "8081:8080"
+    environment: &datanode_env
+      NODE_ID: datanode1
+      DATA_DIR: /data
+      LISTEN_ADDR: ":8080"
+
+      # ADVERTISED_ENDPOINT es la dirección que el nodo reporta al ControlNode y que
+      # el ControlNode entrega a los clientes. Aquí es localhost:8081 —el puerto
+      # publicado en el host— y NO datanode1:8080, que solo es alcanzable desde
+      # dentro de la red de Docker. Esta separación entre dirección interna y
+      # dirección anunciable es exactamente el requisito RD-12.
+      ADVERTISED_ENDPOINT: "localhost:8081"
+
+      CONTROL_ADDR: "controlnode:9090"
+      CAPACITY: "10737418240"
+      HEARTBEAT_INTERVAL: "3s"
+    volumes:
+      - dn1-data:/data
+    restart: unless-stopped
+
+  datanode2:
+    <<: *datanode
+    container_name: dfsha-datanode2
+    ports:
+      - "8082:8080"
+    environment:
+      <<: *datanode_env
+      NODE_ID: datanode2
+      ADVERTISED_ENDPOINT: "localhost:8082"
+    volumes:
+      - dn2-data:/data
+
+  datanode3:
+    <<: *datanode
+    container_name: dfsha-datanode3
+    ports:
+      - "8083:8080"
+    environment:
+      <<: *datanode_env
+      NODE_ID: datanode3
+      ADVERTISED_ENDPOINT: "localhost:8083"
+    volumes:
+      - dn3-data:/data
+
+  datanode4:
+    <<: *datanode
+    container_name: dfsha-datanode4
+    ports:
+      - "8084:8080"
+    environment:
+      <<: *datanode_env
+      NODE_ID: datanode4
+      ADVERTISED_ENDPOINT: "localhost:8084"
+    volumes:
+      - dn4-data:/data
+
+# Un volumen por nodo. Son independientes a propósito: matar un contenedor con
+# `docker compose rm -v` destruye solo sus chunks, que es la forma de demostrar
+# tolerancia a fallos en el Hito 3.
+volumes:
+  dn1-data:
+  dn2-data:
+  dn3-data:
+  dn4-data:

@@ -1,0 +1,32 @@
+# Binarios compilados
+/bin/
+/dfsha-controlnode
+/dfsha-datanode
+
+# Datos locales de los DataNodes (los chunks NO van al repositorio)
+/data/
+*.chunk
+*.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Código generado por protoc (se regenera con `make proto`)
+# Quítalo de aquí si prefieres versionarlo — decisión para DECISIONES.md
+# *.pb.go
+
+# Sistema
+.DS_Store
+
+# Ejecución nativa (scripts/correr-nativo.sh)
+/.run/
+
+# Material del curso y entregas anteriores (el profesor ya los tiene)
+*.pdf
+
+# Configuración de editor
+.kiro/

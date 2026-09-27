@@ -1,0 +1,684 @@
+openapi: 3.0.3
+
+info:
+  title: DFSha — API del plano de control
+  version: "1.0.0"
+  description: |
+    Contrato de la API entre el cliente y el ControlNode (RX-04, RI-01).
+
+    ## Alcance
+    Este documento especifica el Hito 2: camino feliz completo, sin replicación
+    (R=1), sin autenticación y sin TLS. Las operaciones de seguridad son del Hito 6.
+
+    ## Qué NO hace este servicio
+    **Los datos no lo atraviesan** (RQ-13). El ControlNode decide el esquema de
+    particionamiento y devuelve direcciones; los bytes viajan directamente entre el
+    cliente y los DataNodes por HTTP con flujo. El tráfico de este plano es
+    proporcional al **número** de chunks, no a su tamaño.
+
+    ## Descubrimiento dinámico
+    El cliente solo conoce por configuración la dirección de este servicio. Las
+    direcciones de los DataNodes llegan en las respuestas de `allocate` y de
+    `manifest`, en tiempo de ejecución. Ninguna ruta del namespace codifica la
+    identidad de un nodo (RX-14, RQ-24, RQ-25).
+
+    ## Secuencia de escritura
+    El orden es obligatorio y el `commit` va al final:
+
+        POST /v1/obj/open                      -> upload_id, chunk_size
+        POST /v1/obj/{upload_id}/chunk         -> chunk_id, targets     (una vez por chunk)
+        PUT  http://{target}/chunk/{chunk_id}  (directo al DataNode, fuera de esta API)
+        POST /v1/obj/{upload_id}/commit        -> publica la versión
+
+    Hasta que `commit` retorna, un lector de la misma ruta ve la versión anterior
+    íntegra, o un 404 si no había ninguna. La publicación es atómica (RT-07, RQ-10).
+
+    ## Identidad
+    **Limitación declarada del Hito 2:** la identidad viaja en la cabecera
+    `X-DFSha-User` y no se verifica. La autenticación con Argon2id y JWT es del
+    Hito 6 (RQ-15, RQ-16).
+
+servers:
+  - url: http://localhost:8080
+    description: ControlNode en ejecución local
+
+tags:
+  - name: escritura
+    description: Carga multiparte de una versión nueva
+  - name: lectura
+    description: Emisión de manifiestos
+  - name: namespace
+    description: Directorios y objetos
+  - name: diagnóstico
+    description: Membresía y ocupación
+
+components:
+  parameters:
+    PathQuery:
+      name: path
+      in: query
+      required: true
+      description: Ruta absoluta dentro del namespace.
+      schema: { type: string, example: /media/video.mp4 }
+    UploadId:
+      name: upload_id
+      in: path
+      required: true
+      schema: { type: string }
+
+  headers:
+    User:
+      description: Identidad del solicitante (no verificada en el Hito 2).
+      schema: { type: string }
+
+  schemas:
+    Error:
+      type: object
+      required: [error, detail, retryable]
+      properties:
+        error:
+          type: string
+          description: Nombre del estado HTTP.
+          example: Conflict
+        detail:
+          type: string
+          description: Causa concreta, legible.
+          example: "conflicto de escritura: /media/video.mp4 tiene una carga en curso"
+        retryable:
+          type: boolean
+          description: |
+            Si el cliente puede reintentar la misma petición tal cual (RI-05).
+            Un 409 **nunca** es reintentable: el estado del servidor no cambia solo
+            y reintentar produciría una versión duplicada (RC-11).
+          example: false
+
+    OpenUploadRequest:
+      type: object
+      required: [path, size]
+      properties:
+        path:
+          type: string
+          description: Ruta absoluta de destino. Su directorio padre debe existir.
+          example: /media/video.mp4
+        size:
+          type: integer
+          format: int64
+          description: Tamaño total en bytes. Permite validar la carga en el commit.
+          example: 1073741824
+
+    OpenUploadResponse:
+      type: object
+      required: [upload_id, version_id, path, chunk_size, expected_chunks, expires_at]
+      properties:
+        upload_id:
+          type: string
+          description: Identificador de la carga en construcción.
+        version_id:
+          type: string
+          description: |
+            Identidad de la versión que se está construyendo. Es distinta de la ruta
+            porque las versiones son inmutables: escribir crea una nueva al lado de
+            la anterior, y publicarla consiste en mover un puntero (RN-06, RT-07).
+        path: { type: string }
+        chunk_size:
+          type: integer
+          format: int64
+          description: |
+            Tamaño de chunk que decide el ControlNode. El cliente **debe** usar este
+            valor y no uno propio. Es configurable por despliegue (RT-01).
+          example: 67108864
+        expected_chunks:
+          type: integer
+          description: Número de chunks esperado, techo de size/chunk_size.
+        expires_at:
+          type: string
+          format: date-time
+          description: |
+            Vencimiento del lease sobre la clave del objeto. Se renueva con cada
+            asignación de chunk; si el cliente desaparece, la ruta se libera al
+            vencer (RT-18, RN-24).
+
+    AllocateChunkRequest:
+      type: object
+      required: [index, size, checksum]
+      properties:
+        index:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Posición del chunk dentro de la versión, empezando en 0.
+        size:
+          type: integer
+          format: int64
+          description: |
+            Tamaño real de **este** chunk. El último es más corto que los demás y no
+            se rellena: rellenarlo cambiaría el SHA-256 del archivo (RT-02).
+        checksum:
+          type: string
+          description: SHA-256 del contenido del chunk, en hexadecimal minúscula.
+          pattern: '^[0-9a-f]{64}$'
+
+    Target:
+      type: object
+      required: [node_id, endpoint]
+      properties:
+        node_id: { type: string, example: datanode2 }
+        endpoint:
+          type: string
+          description: |
+            Dirección anunciada por el DataNode, en la forma host:puerto. Puede
+            diferir de su dirección interna (RD-12).
+          example: localhost:8082
+
+    ChunkPlan:
+      type: object
+      required: [chunk_id, index, targets, degraded]
+      properties:
+        chunk_id:
+          type: string
+          description: |
+            Identificador global y opaco del chunk. No codifica la ruta, el dueño ni
+            el nodo: el plano de datos no debe poder deducir el namespace (RD-01).
+        index: { type: integer, format: int32 }
+        targets:
+          type: array
+          description: |
+            DataNodes destino, elegidos por el ControlNode. El cliente **nunca** elige
+            a qué nodo escribir (RT-03). Dos réplicas del mismo chunk nunca caen en el
+            mismo nodo (RN-08) y chunks consecutivos empiezan en nodos distintos, que
+            es lo que reparte el archivo entre el clúster (RN-09, RX-12).
+          items: { $ref: '#/components/schemas/Target' }
+        degraded:
+          type: boolean
+          description: |
+            Se asignaron menos destinos que el factor de replicación. La escritura se
+            acepta igual y la reparación queda pendiente (RN-20, RN-21).
+
+    CommitRequest:
+      type: object
+      required: [sha256]
+      properties:
+        sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: |
+            SHA-256 del archivo **completo**, distinto de los checksums por chunk. Los
+            checksums individuales verifican que cada pieza llegó intacta; este
+            verifica que el reensamblado fue correcto —que no falta un chunk ni quedó
+            en el desplazamiento equivocado— (RT-11).
+
+    CommitResponse:
+      type: object
+      required: [version_id, size, sha256, chunks, created_at]
+      properties:
+        version_id: { type: string }
+        size: { type: integer, format: int64 }
+        sha256: { type: string }
+        chunks: { type: integer }
+        created_at: { type: string, format: date-time }
+
+    ManifestChunk:
+      type: object
+      required: [chunk_id, index, size, checksum, endpoints]
+      properties:
+        chunk_id: { type: string }
+        index: { type: integer, format: int32 }
+        size: { type: integer, format: int64 }
+        checksum:
+          type: string
+          description: Se verifica antes de reensamblar; si no coincide, se reintenta contra otra réplica (RT-13).
+        endpoints:
+          type: array
+          description: |
+            Todas las réplicas vivas del chunk, resueltas en el momento de emitir el
+            manifiesto a partir de los inventarios del heartbeat. Si una falla, el
+            cliente usa otra y el usuario no ve el error (RC-10, RQ-26).
+          items: { type: string, example: localhost:8083 }
+
+    Manifest:
+      type: object
+      required: [path, version_id, size, sha256, chunk_size, chunks]
+      properties:
+        path: { type: string }
+        version_id: { type: string }
+        size: { type: integer, format: int64 }
+        sha256: { type: string }
+        chunk_size: { type: integer, format: int64 }
+        chunks:
+          type: array
+          description: |
+            **Lista ordenada**, no un mapa. El orden determina el reensamblado: es el
+            archivo (RN-02). Reordenarla produce un archivo corrupto con todos sus
+            bytes presentes.
+          items: { $ref: '#/components/schemas/ManifestChunk' }
+
+    Entry:
+      type: object
+      required: [name, kind, owner, mode, size, chunks, created_at, modified_at]
+      properties:
+        name: { type: string }
+        kind: { type: string, enum: [dir, object] }
+        owner: { type: string }
+        mode: { type: integer, description: 'Permisos POSIX en octal, ej. 493 = 0755' }
+        size: { type: integer, format: int64, description: 'Tamaño de la versión vigente; 0 en directorios' }
+        chunks: { type: integer }
+        version_id: { type: string }
+        sha256: { type: string }
+        created_at: { type: string, format: date-time }
+        modified_at: { type: string, format: date-time }
+
+    Listing:
+      type: object
+      required: [path, entries]
+      properties:
+        path: { type: string }
+        entries:
+          type: array
+          items: { $ref: '#/components/schemas/Entry' }
+
+    Placement:
+      type: object
+      properties:
+        index: { type: integer, format: int32 }
+        chunk_id: { type: string }
+        size: { type: integer, format: int64 }
+        checksum: { type: string }
+        replicas:
+          type: array
+          description: |
+            Nodos que reportaron tener este chunk en su último heartbeat. Es el estado
+            real observado, no lo que los metadatos dicen que debería ser.
+          items: { type: string }
+
+    StatResponse:
+      type: object
+      required: [path, entry]
+      properties:
+        path: { type: string }
+        entry: { $ref: '#/components/schemas/Entry' }
+        placement:
+          type: array
+          description: Distribución real del objeto entre los DataNodes (RC-06).
+          items: { $ref: '#/components/schemas/Placement' }
+
+    PathRequest:
+      type: object
+      required: [path]
+      properties:
+        path: { type: string, example: /media }
+
+    RenameRequest:
+      type: object
+      required: [from, to]
+      properties:
+        from: { type: string }
+        to: { type: string }
+
+    Node:
+      type: object
+      properties:
+        node_id: { type: string }
+        endpoint: { type: string }
+        capacity: { type: integer, format: int64 }
+        used: { type: integer, format: int64 }
+        in_flight: { type: integer, format: int64 }
+        chunks: { type: integer }
+        draining: { type: boolean }
+        last_seen: { type: string, format: date-time }
+        status:
+          type: string
+          enum: [alive, suspect, dead]
+          description: |
+            Clasificación por tiempo sin reportar (RN-13). El estado intermedio
+            `suspect` existe para que un nodo que reinicia rápido no dispare
+            re-replicación.
+
+    DFResponse:
+      type: object
+      properties:
+        capacity: { type: integer, format: int64 }
+        used: { type: integer, format: int64 }
+        free: { type: integer, format: int64 }
+        alive_nodes: { type: integer }
+        known_chunks: { type: integer }
+        chunk_size: { type: integer, format: int64 }
+        replication_factor: { type: integer }
+
+  responses:
+    BadRequest:
+      description: Petición mal formada o ruta inválida.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: La ruta, la carga o la versión no existen.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: |
+        La clave está ocupada, el directorio no está vacío, o otro cliente tiene una
+        carga en curso sobre la misma ruta. **No reintentable** (RQ-11).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unavailable:
+      description: |
+        Ningún DataNode vivo con espacio disponible. Reintentable con retroceso
+        exponencial. El detalle indica explícitamente la causa (RN-22).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+paths:
+  /v1/obj/open:
+    post:
+      tags: [escritura]
+      summary: Abre una carga y reserva una versión
+      description: |
+        Valida la ruta, toma el lease sobre la clave del objeto y decide el esquema de
+        particionamiento. No escribe ningún byte ni contacta a ningún DataNode.
+
+        Acepta la cabecera `Idempotency-Key`: un reintento tras un timeout devuelve la
+        misma carga en lugar de abrir otra y duplicar la versión (RT-08).
+      parameters:
+        - name: X-DFSha-User
+          in: header
+          schema: { type: string }
+        - name: Idempotency-Key
+          in: header
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OpenUploadRequest' }
+      responses:
+        '201':
+          description: Carga abierta.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OpenUploadResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404':
+          description: El directorio padre de la ruta no existe.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/obj/{upload_id}/chunk:
+    post:
+      tags: [escritura]
+      summary: Asigna el destino de un chunk
+      description: |
+        El ControlNode genera el `chunk_id` y elige los DataNodes destino. Reasignar el
+        mismo índice devuelve el mismo `chunk_id`, para que un reintento no deje chunks
+        huérfanos (RT-08). Cada asignación renueva el lease de la carga (RN-24).
+
+        Tras recibir la respuesta, el cliente sube los bytes con
+        `PUT http://{endpoint}/chunk/{chunk_id}` y la cabecera `X-Chunk-Checksum`.
+      parameters:
+        - $ref: '#/components/parameters/UploadId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AllocateChunkRequest' }
+      responses:
+        '200':
+          description: Destino asignado.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ChunkPlan' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404':
+          description: La carga no existe.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: El lease de la carga venció.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /v1/obj/{upload_id}/commit:
+    post:
+      tags: [escritura]
+      summary: Publica la versión
+      description: |
+        **Última operación de la escritura y única que publica algo.** Valida que la
+        lista de chunks esté completa y sin huecos, que los tamaños sumen lo declarado,
+        y entonces instala la versión como vigente mediante una asignación de puntero
+        bajo candado: no existe instante en el que un lector observe una versión
+        parcial (RT-07, RQ-10). Libera el lease.
+      parameters:
+        - $ref: '#/components/parameters/UploadId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CommitRequest' }
+      responses:
+        '200':
+          description: Versión publicada.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CommitResponse' }
+        '400':
+          description: Faltan chunks, hay un hueco en los índices, o los tamaños no cuadran.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: La carga no existe.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: El lease venció antes del commit.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/obj/{upload_id}:
+    delete:
+      tags: [escritura]
+      summary: Aborta una carga
+      description: |
+        Libera el lease y marca para recolección los chunks ya escritos. El objeto
+        anterior permanece intacto y accesible: nunca se publicó nada (RT-09).
+      parameters:
+        - $ref: '#/components/parameters/UploadId'
+      responses:
+        '200':
+          description: Carga abortada.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  orphan_chunks: { type: integer }
+        '404':
+          description: La carga no existe.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/obj/manifest:
+    get:
+      tags: [lectura]
+      summary: Emite el manifiesto de lectura de un objeto
+      description: |
+        Devuelve la lista ordenada de chunks de la versión vigente con las direcciones
+        vivas de cada réplica. Se emite bajo demanda y refleja el estado del clúster en
+        ese instante (RI-07): las direcciones vienen del registro de membresía, que se
+        reconstruye con los heartbeats, no de nada persistido.
+      parameters:
+        - $ref: '#/components/parameters/PathQuery'
+      responses:
+        '200':
+          description: Manifiesto emitido.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Manifest' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404':
+          description: La ruta no existe o el objeto no tiene versión publicada.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: Ningún nodo vivo reporta alguno de los chunks del objeto.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/ns:
+    get:
+      tags: [namespace]
+      summary: Lista un directorio
+      parameters:
+        - { name: path, in: query, required: false, schema: { type: string, default: / } }
+      responses:
+        '200':
+          description: Contenido del directorio, ordenado por nombre.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Listing' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [namespace]
+      summary: Elimina un objeto o un directorio vacío
+      description: |
+        Un directorio con hijos devuelve 409, que el cliente distingue de 404. No hay
+        borrado recursivo por omisión.
+      parameters:
+        - $ref: '#/components/parameters/PathQuery'
+      responses:
+        '200':
+          description: Eliminado. Los chunks quedan marcados para recolección (RC-05).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  path: { type: string }
+                  orphan_chunks: { type: integer }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/ns/stat:
+    get:
+      tags: [namespace]
+      summary: Detalle de una entrada y distribución real de sus chunks
+      description: |
+        Además de los metadatos, devuelve para cada chunk los nodos que reportaron
+        tenerlo. Es la forma de verificar en vivo que un archivo quedó repartido entre
+        varios DataNodes (RC-06, evidencia de RX-12).
+      parameters:
+        - $ref: '#/components/parameters/PathQuery'
+      responses:
+        '200':
+          description: Detalle de la entrada.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StatResponse' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/ns/dir:
+    post:
+      tags: [namespace]
+      summary: Crea un directorio
+      description: Falla si el padre no existe o el nombre está ocupado. No crea padres intermedios (RC-04).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PathRequest' }
+      responses:
+        '201':
+          description: Directorio creado.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Entry' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404':
+          description: El directorio padre no existe.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/ns/rename:
+    post:
+      tags: [namespace]
+      summary: Renombra o mueve una entrada
+      description: |
+        El costo es independiente del tamaño del objeto (RC-07): no se mueve ningún
+        byte, solo cambia una referencia en el árbol. Ningún DataNode se entera.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RenameRequest' }
+      responses:
+        '200':
+          description: Movido.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  from: { type: string }
+                  to: { type: string }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/nodes:
+    get:
+      tags: [diagnóstico]
+      summary: Estado de membresía de los DataNodes
+      description: |
+        Toda esta información es estado blando: proviene de los heartbeats y no se
+        persiste nunca (RN-03).
+      responses:
+        '200':
+          description: Nodos conocidos.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  nodes:
+                    type: array
+                    items: { $ref: '#/components/schemas/Node' }
+
+  /v1/df:
+    get:
+      tags: [diagnóstico]
+      summary: Ocupación agregada del clúster
+      responses:
+        '200':
+          description: Capacidad y uso.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DFResponse' }
+
+  /health:
+    get:
+      tags: [diagnóstico]
+      summary: Sonda de vida del ControlNode
+      responses:
+        '200':
+          description: Servicio en pie.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  alive_nodes: { type: integer }

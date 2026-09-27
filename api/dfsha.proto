@@ -1,0 +1,72 @@
+// Contrato RPC interno de DFSha (RI-02: entre nodos siempre RPC tipado, nunca REST).
+//
+// Enlace que especifica: ControlNode <-> DataNode.
+// Quién inicia: SIEMPRE el DataNode (RN-12, RD-06). El ControlNode nunca abre una
+// conexión hacia un DataNode; las órdenes viajan en la respuesta al heartbeat.
+syntax = "proto3";
+
+package dfsha.v1;
+
+option go_package = "github.com/thomaszambrano/DFS-Topicos-Telematica/internal/pb;pb";
+
+// DataNodeService lo implementa el ControlNode y lo llama el DataNode.
+// El nombre describe al cliente de la relación, no al servidor.
+service DataNodeService {
+  // Heartbeat reporta el estado completo del DataNode y recibe de vuelta la lista
+  // de órdenes a ejecutar. Es el único canal entre los dos planos.
+  rpc Heartbeat(NodeReport) returns (CommandList);
+}
+
+// NodeReport es el reporte periódico de un DataNode (RD-05).
+// El inventario completo permite al ControlNode reconstruir el mapa
+// chunk -> ubicaciones sin leer su propio disco (RN-03).
+message NodeReport {
+  string node_id = 1;
+
+  // Dirección por la que un cliente externo alcanza a este nodo. Se reporta en
+  // lugar de deducirse de la conexión porque la dirección interna del contenedor
+  // no siempre es alcanzable desde fuera (RD-12).
+  string advertised_endpoint = 2;
+
+  int64 capacity_bytes = 3;
+  int64 used_bytes = 4;
+
+  // Inventario completo de chunks presentes en disco. Es la fuente de verdad de
+  // las ubicaciones: el DataNode tiene la última palabra sobre lo que tiene.
+  repeated string chunk_ids = 5;
+
+  // Peticiones en curso, alimenta la función de puntuación de colocación (RD-10).
+  int64 in_flight = 6;
+
+  int64 timestamp_unix_ms = 7;
+
+  // En drenado el nodo no acepta escrituras nuevas y no debe elegirse como
+  // destino de ninguna asignación (RD-11). En el Hito 2 siempre es false.
+  bool draining = 8;
+}
+
+enum CommandType {
+  COMMAND_TYPE_UNSPECIFIED = 0;
+  // Copiar un chunk hacia otro DataNode (re-replicación y rebalanceo, Hito 3).
+  COMMAND_TYPE_COPY_CHUNK = 1;
+  // Eliminar un chunk local (recolección de huérfanos y exceso de réplicas).
+  COMMAND_TYPE_DELETE_CHUNK = 2;
+  // Reenviar el inventario completo fuera de ciclo.
+  COMMAND_TYPE_REPORT_INVENTORY = 3;
+}
+
+message Command {
+  CommandType type = 1;
+  string chunk_id = 2;
+  // Destino para COPY_CHUNK, en la forma host:puerto.
+  string target_endpoint = 3;
+}
+
+// CommandList es la respuesta al heartbeat. En el Hito 2 viaja siempre vacía: el
+// campo existe desde ahora para que la dirección de la comunicación quede fijada
+// y el Hito 3 no cambie el contrato.
+message CommandList {
+  repeated Command commands = 1;
+  // Permite al ControlNode ajustar el ritmo de reporte sin reiniciar el DataNode.
+  int64 heartbeat_interval_ms = 2;
+}
