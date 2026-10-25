@@ -212,13 +212,63 @@ correcta es medirla antes de cambiarlo.
 
 ---
 
-# Decisiones pendientes para el Hito 3
+## D-013 — El Commit registra solo las réplicas confirmadas y exige quórum W
 
-| # | Decisión |
-| --- | --- |
-| P-1 | Heurística de colocación: dos candidatos aleatorios con puntuación (RN-10, RN-11) |
-| P-2 | Replicación en pipeline y quórum de escritura W=2 (RT-05, RT-06) |
-| P-3 | WAL con `fsync` + snapshot, y modo seguro al arrancar (RN-04, RN-05) |
-| P-4 | Recolector de chunks huérfanos (RN-07) |
-| P-5 | Re-replicación priorizada y control de ritmo (RN-14, RN-16) |
-| P-6 | Rebalanceo con umbrales 10 % / 5 % y drenado (RN-17, RN-19) |
+**Fecha:** 2026-10-17
+**Elegido:** el cliente informa en el `commit`, por cada chunk, qué DataNodes le
+respondieron 201 (el ACK). El ControlNode registra como réplicas solo esos nodos, descarta
+los que no asignó él mismo y rechaza el commit si algún chunk tiene menos de W
+confirmaciones. W se acota por los destinos asignados, así que con R=1 basta una.
+**Descartado:** suponer que todos los destinos asignados recibieron el chunk, que era el
+comportamiento del Hito 2.
+**Porqué:** con R>1 lo normal es que algún destino falle durante una subida larga. Si se
+asumieran todas las réplicas, el ControlNode creería tener 3 copias de un chunk que solo
+tiene 2 y el replicador nunca lo repararía. Es el mismo argumento de D-002: no registrar
+como cierto lo que nadie confirmó. Ignorar nodos no asignados impide que un cliente
+declare réplicas donde el ControlNode no decidió escribir (RT-03). Con W=2 y R=3 la
+escritura tolera la caída de un destino (RT-06) y la tercera copia la completa D-014.
+Atenúa el problema A2 de `ANALISIS_CONSISTENCIA.md`, aunque el ACK sigue llegando a
+través del cliente.
+
+---
+
+## D-014 — Re-replicación por órdenes en la respuesta al heartbeat
+
+**Fecha:** 2026-10-17
+**Elegido:** un replicador en el ControlNode revisa cada 5 s los chunks de las versiones
+vigentes, ordena por menos copias primero (RN-14), elige el origen y el destino de menor
+carga y encola `COPY_CHUNK` para el origen. La orden viaja en la respuesta al heartbeat y
+el origen envía el chunk al destino por gRPC con flujo (`ChunkService.ReplicateChunk`).
+Las copias en curso se recuerdan 45 s para no pedir la misma dos veces.
+**Descartado:** que el ControlNode llame al DataNode para ordenar la copia, o que lea y
+reenvíe los bytes él mismo.
+**Porqué:** respeta RN-12 (el ControlNode nunca abre conexión hacia un DataNode) y RQ-13
+(los bytes no atraviesan el ControlNode). Un nodo sospechoso sigue contando como réplica:
+solo se repara al pasar a muerto, para que un reinicio rápido no dispare copias (RN-13).
+
+---
+
+## D-015 — El cliente escribe en los R destinos; el pipeline queda preparado
+
+**Fecha:** 2026-10-17
+**Elegido:** el cliente sube cada chunk a cada destino por HTTP. El contrato gRPC entre
+DataNodes ya incluye `downstream` y el DataNode reenvía en cadena (probado en
+`TestReplicateChunkPipeline`), pero el camino de escritura del cliente aún no lo usa.
+**Descartado:** terminar el pipeline en esta entrega.
+**Porqué:** primero se necesitaba que la replicación fuera correcta (quórum y reparación);
+el pipeline es una optimización de tráfico. **Costo declarado:** el tráfico de subida es R
+veces el archivo y no cumple todavía RT-05. Pasar a pipeline no cambia el contrato: el
+cliente enviaría al primer destino con los demás en `downstream`.
+
+---
+
+# Decisiones pendientes
+
+| # | Decisión | Estado |
+| --- | --- | --- |
+| P-1 | Heurística de colocación: dos candidatos aleatorios con puntuación (RN-10, RN-11) | Pendiente |
+| P-2 | Replicación en pipeline y quórum de escritura W=2 (RT-05, RT-06) | Quórum hecho (D-013); pipeline pendiente (D-015) |
+| P-3 | WAL con `fsync` + snapshot, y modo seguro al arrancar (RN-04, RN-05) | Pendiente |
+| P-4 | Recolector de chunks huérfanos (RN-07) | Pendiente |
+| P-5 | Re-replicación priorizada y control de ritmo (RN-14, RN-16) | Re-replicación hecha (D-014); control de ritmo pendiente |
+| P-6 | Rebalanceo con umbrales 10 % / 5 % y drenado (RN-17, RN-19) | Pendiente |
