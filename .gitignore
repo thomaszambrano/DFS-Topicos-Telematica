@@ -27,6 +27,7 @@ venv/
 
 # Material del curso y entregas anteriores (el profesor ya los tiene)
 *.pdf
+!INFORME.pdf
 
 # Configuración de editor
 .kiro/

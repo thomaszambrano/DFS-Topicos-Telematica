@@ -1,7 +1,7 @@
 # DFSha — Sistema de archivos distribuido
 
 **ST0263 Tópicos Especiales en Telemática / SI3007 Sistemas Distribuidos — 2026-2**
-Camilo Ruiz · Carlos Ochoa · Thomas Osorio
+Camilo Ruiz · Carlos Ochoa · Thomas Osorio — [Informe técnico](INFORME.md) ([PDF](INFORME.pdf)) · [Video demostración](https://youtu.be/No2hkhglwMw)
 
 Servidor en **Go**, cliente en **Python**. Plano de control (ControlNode) y plano de
 datos (DataNodes) separados: los metadatos viajan por REST y gRPC, los bytes van
@@ -212,6 +212,7 @@ cmd/{controlnode,datanode}/ ejecutables
 client/dfsha/               chunker, SDK, transferencia, consola
 docker/                     imágenes multietapa
 scripts/verificar.sh        verificación del hito (E.2)
+INFORME.md                  informe técnico: objetivos, arquitectura, pruebas, resultados
 DECISIONES.md               bitácora de decisiones de diseño
 ```
 
