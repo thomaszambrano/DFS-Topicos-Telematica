@@ -29,8 +29,7 @@ disponibilidad, rendimiento, transparencia y seguridad.
 7. Usar REST entre el cliente y el servidor, y gRPC entre los nodos, como exige el enunciado.
 
 ### 1.3 Alcance logrado
-El sistema corresponde al Hito 3 parcial. La tabla de la sección 6.4 muestra el estado
-de cada requisito del enunciado.
+El sistema corresponde al Hito 3 parcial. La sección 7 detalla lo que queda pendiente.
 
 ### 1.4 Marco teórico
 **Sistema de archivos distribuido (DFS).** Un DFS ofrece a sus clientes un único espacio
@@ -320,22 +319,6 @@ Sobre el clúster real en Docker:
 - Limitación: el cliente sube las R copias él mismo, así que el tráfico de subida es R
   veces el archivo. El reenvío en cadena entre DataNodes ya está implementado y probado,
   pero el cliente aún no lo usa (D-015).
-
-### 6.4 Estado frente a los requisitos del enunciado
-
-| Requisito | Estado |
-| --- | --- |
-| RF1 Gestión del FS (`ls`, `cd`, `mkdir`, `rmdir`, `rm`, `mv`, `stat`) | ✅ |
-| RF2 Transferencia (`put`/`get`, SDK `send`/`receive`) | ✅ |
-| RF3 Acceso (`open`/`read`/`write`/`lock`) | ⚠️ Parcial: modelo de objetos (escritura completa, lease como lock de escritura), sin lectura aleatoria |
-| RNF1 Escalabilidad | ✅ plano de datos separado y heurística; ⚠️ un solo ControlNode |
-| RNF2 Alta disponibilidad | ✅ réplicas, quórum, re-replicación; ❌ ControlNode replicado |
-| RNF3 Consistencia | ✅ commit atómico, chunks inmutables, leases |
-| RNF4 Particionamiento | ✅ chunks repartidos entre los 4 nodos |
-| RNF5 Rendimiento y concurrencia | ✅ transferencias paralelas, leases; ⚠️ sin pipeline |
-| RNF6 Seguridad | ⚠️ usuario/contraseña con Argon2id, token y aislamiento por usuario; ❌ TLS, cifrado en reposo, seguridad entre nodos |
-| RNF7 Transparencia | ✅ ubicación dinámica (el cliente solo conoce al ControlNode), consola tipo Linux |
-| gRPC entre nodos | ✅ `DataNodeService` y `ChunkService` |
 
 ---
 
