@@ -405,3 +405,16 @@ func (r *Registry) PlanReplication(chunks []types.ChunkID, want int, pending map
 	}
 	return tasks
 }
+
+// Reserve suma ocupación provisional a un nodo recién elegido como destino.
+//
+// Sin esto, entre dos heartbeats el nodo sigue pareciendo igual de vacío y todas las
+// asignaciones de esos segundos caen en él (efecto manada, problema P1). No es
+// persistente ni exacto: el próximo heartbeat reemplaza Used por el valor real.
+func (r *Registry) Reserve(id types.NodeID, bytes int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if n, ok := r.nodes[id]; ok {
+		n.Used += bytes
+	}
+}

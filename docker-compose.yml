@@ -34,6 +34,12 @@ services:
       # completa después, por re-replicación, si no confirmó a tiempo.
       WRITE_QUORUM: "2"
 
+      # Clave que firma los tokens de sesión (RQ-16). Fija para que un reinicio del
+      # contenedor no invalide las sesiones abiertas. EN PRODUCCIÓN va en un secreto,
+      # nunca en el repositorio.
+      AUTH_SECRET: "dfsha-demo-cambiar-en-produccion-0123456789"
+      TOKEN_TTL: "15m"
+
       SUSPECT_AFTER: "9s"
       DEAD_AFTER: "30s"
       HEARTBEAT_INTERVAL: "3s"

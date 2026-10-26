@@ -260,13 +260,39 @@ el pipeline es una optimización de tráfico. **Costo declarado:** el tráfico d
 veces el archivo y no cumple todavía RT-05. Pasar a pipeline no cambia el contrato: el
 cliente enviaría al primer destino con los demás en `downstream`.
 
+## D-016 — Colocación por dos candidatos aleatorios con puntuación
+
+**Fecha:** 2026-10-25
+**Elegido:** por cada réplica se toman dos nodos vivos al azar con espacio para el chunk
+y se queda el de mayor `0.5·(1−ocupación) + 0.3·(1−carga) + 0.2·dispersión`; la
+dispersión penaliza los nodos del chunk anterior (RN-09). El elegido recibe una
+ocupación provisional (`Registry.Reserve`) que el siguiente heartbeat corrige.
+**Descartado:** rotación por índice (Hito 2) y elegir siempre el mejor.
+**Porqué:** la rotación ignora la ocupación; elegir siempre el mejor manda todas las
+escrituras de los próximos segundos al mismo nodo, porque su ocupación solo se
+actualiza con el heartbeat (efecto manada). Dos al azar reparte casi igual que mirar
+todos y evita la manada. Verificado en `TestSelectBalanceaOcupacion` (≤ 10 %, RN-11).
+
+## D-017 — Argon2id y token HMAC autoverificable
+
+**Fecha:** 2026-10-25
+**Elegido:** contraseñas con Argon2id (64 MB, salt de 16 bytes) y un token
+`base64(usuario|expira).HMAC-SHA256` de 15 min. Un middleware lo valida y pone el
+usuario en el contexto; cada ruta se limita a `/home/<usuario>` tras `path.Clean`.
+**Descartado:** la cabecera `X-DFSha-User` (falsificable), SHA-256 simple para las
+contraseñas (demasiado rápido de atacar) y sesiones guardadas en tabla.
+**Porqué:** Argon2id es costoso en memoria a propósito, lo que encarece la fuerza bruta;
+el token se verifica solo con la clave, sin estado compartido, así que sirve igual el
+día que haya varios ControlNodes. **Costo declarado:** sin TLS el token viaja en claro,
+no se puede revocar antes de vencer y los DataNodes no verifican nada todavía.
+
 ---
 
 # Decisiones pendientes
 
 | # | Decisión | Estado |
 | --- | --- | --- |
-| P-1 | Heurística de colocación: dos candidatos aleatorios con puntuación (RN-10, RN-11) | Pendiente |
+| P-1 | Heurística de colocación: dos candidatos aleatorios con puntuación (RN-10, RN-11) | Hecho (D-016) |
 | P-2 | Replicación en pipeline y quórum de escritura W=2 (RT-05, RT-06) | Quórum hecho (D-013); pipeline pendiente (D-015) |
 | P-3 | WAL con `fsync` + snapshot, y modo seguro al arrancar (RN-04, RN-05) | Pendiente |
 | P-4 | Recolector de chunks huérfanos (RN-07) | Pendiente |

@@ -158,6 +158,14 @@ class Shell:
             print(f"{n['node_id']:<14} {n['status']:<9} {n['endpoint']:<26} "
                   f"{_human(n['used']):>10} {_human(n['capacity']):>10} {n['chunks']:>7}")
 
+    def cmd_replication(self, args: list[str]) -> None:
+        """Sin argumento muestra R; con un argumento lo cambia en caliente (RN-23)."""
+        if args:
+            r = self.control.set_replication(int(args[0]))["replication_factor"]
+            print(f"R = {r} (el replicador completa las copias en <= 5 s)")
+        else:
+            print(f"R = {self.control.df()['replication_factor']}")
+
     def cmd_help(self, args: list[str]) -> None:
         print(HELP)
 
@@ -169,6 +177,7 @@ class Shell:
         "rmdir": cmd_rmdir, "rm": cmd_rm, "stat": cmd_stat, "mv": cmd_mv,
         "put": cmd_put, "get": cmd_get, "df": cmd_df, "nodes": cmd_nodes,
         "help": cmd_help, "?": cmd_help, "exit": cmd_exit, "quit": cmd_exit,
+        "replication": cmd_replication,
     }
 
     # -- bucle --------------------------------------------------------------
@@ -226,6 +235,7 @@ HELP = """comandos disponibles:
   get <remoto> [local]     descarga en paralelo y verifica el sha256
   df                       ocupación agregada del clúster
   nodes                    estado de membresía de los DataNodes
+  replication [n]          muestra o cambia el factor de replicación
   help                     esta ayuda
   exit                     salir"""
 

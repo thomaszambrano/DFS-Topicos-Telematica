@@ -20,6 +20,11 @@ var (
 	ErrConflict   = errors.New("conflicto de escritura")
 	ErrNoNodes    = errors.New("sin DataNodes disponibles")
 	ErrIncomplete = errors.New("carga incompleta")
+
+	// Seguridad (RQ-15, RX-13): 401 es "no sé quién eres", 403 es "sé quién eres y
+	// no puedes tocar eso". Ninguno se reintenta: el resultado no cambiaría.
+	ErrUnauthorized = errors.New("no autenticado")
+	ErrForbidden    = errors.New("sin permiso")
 )
 
 // HTTPStatus traduce un error del dominio a su código HTTP.
@@ -36,6 +41,10 @@ func HTTPStatus(err error) int {
 		return http.StatusBadRequest
 	case errors.Is(err, ErrNoNodes):
 		return http.StatusServiceUnavailable
+	case errors.Is(err, ErrUnauthorized):
+		return http.StatusUnauthorized
+	case errors.Is(err, ErrForbidden):
+		return http.StatusForbidden
 	default:
 		return http.StatusInternalServerError
 	}

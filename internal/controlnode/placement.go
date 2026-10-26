@@ -2,6 +2,9 @@ package controlnode
 
 import (
 	"fmt"
+	"math/rand/v2"
+
+	"github.com/thomaszambrano/DFS-Topicos-Telematica/internal/types"
 )
 
 // Placer decide en qué DataNodes se escribe cada chunk.
@@ -18,51 +21,79 @@ func NewPlacer(reg *Registry) *Placer {
 	return &Placer{reg: reg}
 }
 
-// Select elige los r DataNodes destino para el chunk que ocupa la posición index.
+// Select elige r DataNodes distintos para un chunk de `size` bytes.
 //
-// Reglas que aplica, en orden:
+// Heurística de dos candidatos aleatorios con puntuación (RN-10, RN-11):
 //
-//  1. Solo nodos vivos, no en drenado y con espacio libre.
-//  2. INVARIANTE DURA (RN-08): los r destinos son nodos distintos. Dos réplicas del
-//     mismo chunk en el mismo nodo no son dos réplicas.
-//  3. INVARIANTE BLANDA (RN-09): chunks consecutivos empiezan en nodos distintos.
-//     Se logra rotando el orden de los candidatos según el índice del chunk. Sin
-//     esto, un archivo entero caería en el nodo más vacío y ni la escritura ni la
-//     lectura se repartirían (RX-11, RX-12).
-//  4. Dentro de esa rotación, los candidatos vienen ordenados por ocupación
-//     ascendente, así que el reparto tiende a igualar el uso entre nodos.
+//	score = 0.5·(1 − ocupación) + 0.3·(1 − carga) + 0.2·dispersión
 //
-// En el Hito 2 r = 1. La firma acepta r > 1 desde ahora para que el Hito 3 no la
-// cambie: ahí entra la heurística de dos candidatos aleatorios con puntuación
-// (RN-10, RN-11), que reemplaza el punto 4 sin tocar el 1, 2 ni 3.
-func (p *Placer) Select(index uint32, r int) ([]*NodeState, error) {
+// Elegir siempre el mejor nodo manda todas las escrituras concurrentes al mismo
+// destino hasta el próximo heartbeat; elegir al azar puro reparte mal. Tomar dos al
+// azar y quedarse con el mejor reparte casi como mirar todos, sin efecto manada.
+//
+// Invariantes: los r destinos son distintos (RN-08, dura) y se penalizan los nodos
+// del chunk anterior `prev` para esparcir el archivo (RN-09, blanda).
+func (p *Placer) Select(index uint32, r int, size int64, prev []types.NodeID) ([]*NodeState, error) {
 	if r < 1 {
 		return nil, fmt.Errorf("%w: factor de replicación %d", ErrBadRequest, r)
 	}
 
-	candidates := p.reg.Alive()
-	usable := make([]*NodeState, 0, len(candidates))
-	for _, n := range candidates {
-		if n.Free() > 0 {
+	// Espacio para ESTE chunk, no solo "algo libre" (problema P3).
+	var usable []*NodeState
+	for _, n := range p.reg.Alive() {
+		if n.Free() >= size {
 			usable = append(usable, n)
 		}
 	}
 	if len(usable) == 0 {
-		// 503: no hay dónde escribir. El error dice explícitamente la causa (RN-22).
-		return nil, fmt.Errorf("%w: ningún DataNode vivo con espacio disponible", ErrNoNodes)
+		return nil, fmt.Errorf("%w: ningún DataNode vivo con %d bytes libres", ErrNoNodes, size)
 	}
 
-	// La rotación es lo que separa chunks consecutivos. Con 4 nodos, el chunk 0
-	// arranca en el primer candidato, el 1 en el segundo, y así: el archivo se
-	// esparce en lugar de apilarse.
-	offset := int(index) % len(usable)
+	maxLoad := int64(1)
+	for _, n := range usable {
+		maxLoad = max(maxLoad, n.InFlight)
+	}
+	// Nodos del chunk anterior: elegirlos de nuevo apilaría el archivo (RN-09).
+	avoid := make(map[types.NodeID]bool, len(prev))
+	for _, id := range prev {
+		avoid[id] = true
+	}
+
 	picked := make([]*NodeState, 0, r)
-	for i := 0; i < len(usable) && len(picked) < r; i++ {
-		picked = append(picked, usable[(offset+i)%len(usable)])
+	for len(picked) < r && len(usable) > 0 {
+		i := bestOfTwo(usable, maxLoad, avoid)
+		picked = append(picked, usable[i])
+		// Se saca de la lista: dos réplicas nunca en el mismo nodo (RN-08).
+		usable = append(usable[:i], usable[i+1:]...)
 	}
-
-	// Menos destinos que r: se acepta la escritura y se marca degradada en lugar de
-	// rechazarla (RN-20). Rechazar dejaría el sistema inservible cada vez que el
-	// clúster encoge por debajo de R, y RX-07 dice que eso va a pasar en vivo.
+	for _, n := range picked {
+		p.reg.Reserve(n.ID, size)
+	}
+	// Menos destinos que r: escritura degradada, no rechazada (RN-20).
 	return picked, nil
+}
+
+func score(n *NodeState, maxLoad int64, avoid map[types.NodeID]bool) float64 {
+	dispersion := 1.0
+	if avoid[n.ID] {
+		dispersion = 0
+	}
+	load := float64(n.InFlight) / float64(maxLoad)
+	return 0.5*(1-n.Utilization()) + 0.3*(1-load) + 0.2*dispersion
+}
+
+// bestOfTwo devuelve el índice del mejor de dos candidatos distintos al azar.
+func bestOfTwo(c []*NodeState, maxLoad int64, avoid map[types.NodeID]bool) int {
+	if len(c) == 1 {
+		return 0
+	}
+	a := rand.IntN(len(c))
+	b := rand.IntN(len(c) - 1)
+	if b >= a {
+		b++ // garantiza b != a sin reintentar
+	}
+	if score(c[b], maxLoad, avoid) > score(c[a], maxLoad, avoid) {
+		return b
+	}
+	return a
 }

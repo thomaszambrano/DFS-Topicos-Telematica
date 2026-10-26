@@ -40,8 +40,9 @@ No son omisiones; son alcance pendiente y están documentadas en `DECISIONES.md`
    que el tráfico de subida es R veces el archivo. El DataNode ya sabe reenviar en cadena
    (`ChunkService`, campo `downstream`, con test), pero el camino de escritura del
    cliente todavía no lo usa (D-015).
-3. **Sin autenticación ni TLS.** La identidad viaja en la cabecera `X-DFSha-User` y no
-   se verifica. Los canales gRPC usan credenciales inseguras.
+3. **Seguridad básica, sin TLS.** Hay registro y login (Argon2id), token HMAC de 15 min y
+   aislamiento por `/home/<usuario>` (D-017). Faltan TLS, tokens por chunk hacia los
+   DataNodes y cifrado en reposo; los usuarios viven en memoria como el namespace.
 4. **Sin recolección de huérfanos ni de excedentes.** Sobrescribir un objeto deja en disco
    los chunks de la versión anterior; bajar R o recuperar un nodo deja copias de más. La
    orden `DELETE_CHUNK` ya existe en el DataNode, pero el ControlNode aún no la emite.

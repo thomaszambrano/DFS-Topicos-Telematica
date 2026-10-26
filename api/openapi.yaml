@@ -7,8 +7,9 @@ info:
     Contrato de la API entre el cliente y el ControlNode (RX-04, RI-01).
 
     ## Alcance
-    Este documento especifica el Hito 2: camino feliz completo, sin replicación
-    (R=1), sin autenticación y sin TLS. Las operaciones de seguridad son del Hito 6.
+    Hito 3 parcial: replicación con R configurable en caliente, quórum de escritura W,
+    re-replicación automática y seguridad básica (login y aislamiento por usuario).
+    Sin TLS todavía.
 
     ## Qué NO hace este servicio
     **Los datos no lo atraviesan** (RQ-13). El ControlNode decide el esquema de
@@ -33,10 +34,12 @@ info:
     Hasta que `commit` retorna, un lector de la misma ruta ve la versión anterior
     íntegra, o un 404 si no había ninguna. La publicación es atómica (RT-07, RQ-10).
 
-    ## Identidad
-    **Limitación declarada del Hito 2:** la identidad viaja en la cabecera
-    `X-DFSha-User` y no se verifica. La autenticación con Argon2id y JWT es del
-    Hito 6 (RQ-15, RQ-16).
+    ## Identidad (RQ-15, RQ-16, RX-13)
+    `POST /v1/auth/register` crea el usuario (contraseña guardada con Argon2id y salt
+    aleatorio) y su directorio `/home/<usuario>`. `POST /v1/auth/login` entrega un token
+    firmado con HMAC-SHA256 que vence a los 15 min. Toda otra ruta exige
+    `Authorization: Bearer <token>` (401 si falta o es inválido), salvo `/health` y los
+    `GET` de diagnóstico. Cada usuario solo opera dentro de su home (403 fuera de él).
 
 servers:
   - url: http://localhost:8080
@@ -52,7 +55,15 @@ tags:
   - name: diagnóstico
     description: Membresía y ocupación
 
+security:
+  - bearerAuth: []
+
 components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Token de `POST /v1/auth/login`. Formato `base64(usuario|expira).hmac`.
   parameters:
     PathQuery:
       name: path
@@ -356,6 +367,23 @@ components:
         chunk_size: { type: integer, format: int64 }
         replication_factor: { type: integer }
 
+    Credentials:
+      type: object
+      required: [user, password]
+      properties:
+        user: { type: string, pattern: '^[a-z0-9_-]{1,32}$', example: thomas }
+        password: { type: string, minLength: 8, format: password }
+
+    ReplicationConfig:
+      type: object
+      required: [replication_factor]
+      properties:
+        replication_factor:
+          type: integer
+          minimum: 1
+          maximum: 64
+          example: 3
+
   responses:
     BadRequest:
       description: Petición mal formada o ruta inválida.
@@ -374,6 +402,16 @@ components:
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: Falta el token, es inválido o venció. No reintentable sin volver a iniciar sesión.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: La ruta está fuera de `/home/<usuario>` (RX-13).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
     Unavailable:
       description: |
         Ningún DataNode vivo con espacio disponible. Reintentable con retroceso
@@ -383,6 +421,53 @@ components:
           schema: { $ref: '#/components/schemas/Error' }
 
 paths:
+  /v1/auth/register:
+    post:
+      tags: [autenticación]
+      summary: Crea un usuario y su directorio /home/<usuario>
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Credentials' }
+      responses:
+        '201':
+          description: Usuario creado.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { type: string }
+                  home: { type: string, example: /home/thomas }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/auth/login:
+    post:
+      tags: [autenticación]
+      summary: Verifica la contraseña y entrega un token de sesión
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Credentials' }
+      responses:
+        '200':
+          description: Sesión iniciada.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+                  token_type: { type: string, example: Bearer }
+                  expires_in: { type: integer, example: 900 }
+                  home: { type: string, example: /home/thomas }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
   /v1/obj/open:
     post:
       tags: [escritura]
@@ -394,9 +479,6 @@ paths:
         Acepta la cabecera `Idempotency-Key`: un reintento tras un timeout devuelve la
         misma carga en lugar de abrir otra y duplicar la versión (RT-08).
       parameters:
-        - name: X-DFSha-User
-          in: header
-          schema: { type: string }
         - name: Idempotency-Key
           in: header
           schema: { type: string }
@@ -681,6 +763,27 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/DFResponse' }
+
+  /v1/config/replication:
+    put:
+      tags: [diagnóstico]
+      summary: Cambia el factor de replicación en caliente (RX-07, RN-23)
+      description: |
+        No reinicia nada. El replicador programa las copias faltantes en su
+        próximo ciclo (≤ 5 s). Bajar R no borra copias sobrantes (limitación declarada).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReplicationConfig' }
+      responses:
+        '200':
+          description: Factor aplicado.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReplicationConfig' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
 
   /health:
     get:

@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"log"
@@ -53,6 +54,11 @@ type config struct {
 	LeaseTTL time.Duration
 
 	HeartbeatInterval time.Duration // ritmo que el ControlNode sugiere a los nodos
+
+	// AuthSecret firma los tokens de sesión (RQ-16). Si no se configura se genera una
+	// al azar: funciona, pero los tokens dejan de valer al reiniciar.
+	AuthSecret []byte
+	TokenTTL   time.Duration
 }
 
 func loadConfig() (config, error) {
@@ -92,6 +98,18 @@ func loadConfig() (config, error) {
 	if cfg.HeartbeatInterval, err = envDuration("HEARTBEAT_INTERVAL", 3*time.Second); err != nil {
 		return cfg, err
 	}
+	if cfg.TokenTTL, err = envDuration("TOKEN_TTL", 15*time.Minute); err != nil {
+		return cfg, err
+	}
+	if secret := os.Getenv("AUTH_SECRET"); secret != "" {
+		cfg.AuthSecret = []byte(secret)
+	} else {
+		cfg.AuthSecret = make([]byte, 32)
+		if _, err := rand.Read(cfg.AuthSecret); err != nil {
+			return cfg, err
+		}
+		log.Print("AUTH_SECRET no definido: se generó uno aleatorio; los tokens no sobreviven un reinicio")
+	}
 	return cfg, nil
 }
 
@@ -117,6 +135,7 @@ func main() {
 
 	replicator := controlnode.NewReplicator(namespace, registry, allocator)
 	server.AttachReplicator(replicator)
+	server.AttachAuth(controlnode.NewAuth(cfg.AuthSecret, cfg.TokenTTL))
 	go replicator.Run(ctx)
 
 	httpSrv := &http.Server{

@@ -245,7 +245,12 @@ func (a *Allocator) AllocateChunk(uploadID string, index uint32, size int64, che
 		return a.planFor(existing, index), nil
 	}
 
-	nodes, err := a.placer.Select(index, a.r)
+	var prev []types.NodeID
+	if index > 0 {
+		prev = up.chunks[index-1].Replicas
+	}
+	nodes, err := a.placer.Select(index, a.r, size, prev)
+
 	if err != nil {
 		return nil, err
 	}

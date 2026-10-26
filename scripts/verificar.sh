@@ -13,7 +13,9 @@ cd "$RAIZ"
 
 CONTROL="${DFSHA_CONTROL:-http://localhost:8080}"
 TAM_MB="${TAM_MB:-40}"
-REMOTO="${REMOTO:-/demo/prueba.bin}"
+USUARIO="${USUARIO:-verificador}"
+HOME_REMOTO="/home/$USUARIO"
+REMOTO="${REMOTO:-$HOME_REMOTO/demo/prueba.bin}"
 TRABAJO="$(mktemp -d)"
 ORIGINAL="$TRABAJO/original.bin"
 RECUPERADO="$TRABAJO/recuperado.bin"
@@ -29,7 +31,10 @@ sha256() {
   else shasum -a 256 "$1" | awk '{print $1}'; fi
 }
 
-dfsha() { (cd client && python3 -m dfsha --control "$CONTROL" --user verificador run "$@"); }
+# Cada invocación inicia sesión (--register es idempotente: si el usuario ya existe, solo
+# hace login). Desde la seguridad básica, toda operación del namespace exige token.
+dfsha() { (cd client && DFSHA_PASSWORD="${DFSHA_PASSWORD:-verificador123}" \
+  python3 -m dfsha --control "$CONTROL" --user "$USUARIO" --register run "$@"); }
 
 # ---------------------------------------------------------------- preparación
 azul "0. Estado del clúster"
@@ -49,8 +54,18 @@ verde "$VIVOS DataNodes vivos"
 
 # ---------------------------------------------------------------- E.2.1
 azul "E.2.1  Crear directorios y listar"
-dfsha mkdir /demo 2>/dev/null || echo "  /demo ya existía"
-dfsha ls /
+dfsha mkdir "$HOME_REMOTO/demo" 2>/dev/null || echo "  $HOME_REMOTO/demo ya existía"
+dfsha ls "$HOME_REMOTO"
+
+# ---------------------------------------------------------------- seguridad
+azul "Seguridad básica (RQ-15, RQ-16, RX-13)"
+SIN_TOKEN=$(curl -s -o /dev/null -w '%{http_code}' "$CONTROL/v1/ns?path=$HOME_REMOTO")
+echo "  GET /v1/ns sin token            -> $SIN_TOKEN (se espera 401)"
+[ "$SIN_TOKEN" = "401" ] || { rojo "FALLO: el namespace responde sin autenticación"; exit 1; }
+(cd client && DFSHA_PASSWORD=intruso123 python3 -m dfsha --control "$CONTROL" --user intruso --register \
+  run ls "$HOME_REMOTO" >/dev/null 2>&1) && { rojo "FALLO: otro usuario pudo listar $HOME_REMOTO"; exit 1; }
+echo "  intruso listando $HOME_REMOTO -> rechazado (403)"
+verde "OK: token obligatorio y cada usuario aislado en su /home"
 
 # ---------------------------------------------------------------- E.2.2
 azul "E.2.2  Subir un archivo de ${TAM_MB} MB y observar el reparto"

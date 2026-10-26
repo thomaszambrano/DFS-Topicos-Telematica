@@ -103,11 +103,15 @@ class ControlClient:
         self.base_url = base_url.rstrip("/")
         self.user = user
         self.timeout = timeout
+        self.token: str | None = None
+        self._password: str | None = None
 
     # -- utilidades internas ------------------------------------------------
 
     def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
-        headers = {"X-DFSha-User": self.user, "Accept": "application/json"}
+        headers = {"Accept": "application/json"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
         if extra:
             headers.update(extra)
         return headers
@@ -118,12 +122,33 @@ class ControlClient:
         if payload is not None:
             body = json.dumps(payload).encode()
             headers["Content-Type"] = "application/json"
-        _, _, data = _request(method, f"{self.base_url}{path}", body=body, headers=headers, timeout=self.timeout)
+        try:
+            _, _, data = _request(method, f"{self.base_url}{path}", body=body, headers=headers, timeout=self.timeout)
+        except DFShaError as e:
+            # El token dura 15 min (RQ-16). Si venció en medio de la sesión se renueva
+            # una sola vez con la contraseña que el usuario ya escribió, sin pedirla otra vez.
+            if e.status != 401 or not self._password or path.startswith("/v1/auth/"):
+                raise
+            self.login(self.user, self._password)
+            headers.update(self._headers())
+            _, _, data = _request(method, f"{self.base_url}{path}", body=body, headers=headers, timeout=self.timeout)
         return json.loads(data) if data else None
 
     @staticmethod
     def _q(path: str) -> str:
         return urllib.parse.urlencode({"path": path})
+
+    # -- autenticación -------------------------------------------------------
+
+    def register(self, user: str, password: str) -> dict:
+        """Crea el usuario y su directorio /home/<user>."""
+        return self._json("POST", "/v1/auth/register", {"user": user, "password": password})
+
+    def login(self, user: str, password: str) -> dict:
+        """Guarda el token: las demás llamadas lo envían solas en Authorization."""
+        data = self._json("POST", "/v1/auth/login", {"user": user, "password": password})
+        self.token, self.user, self._password = data["token"], user, password
+        return data
 
     # -- escritura ----------------------------------------------------------
 
@@ -186,6 +211,10 @@ class ControlClient:
 
     def df(self) -> dict:
         return self._json("GET", "/v1/df")
+
+    def set_replication(self, n: int) -> dict:
+        """Cambia R en caliente; el replicador completa las copias faltantes"""
+        return self._json("PUT", "/v1/config/replication", {"replication_factor": n})
 
 
 class DataClient:

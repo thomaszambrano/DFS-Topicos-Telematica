@@ -3,6 +3,8 @@ package controlnode
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"time"
@@ -23,6 +25,7 @@ type Server struct {
 	reg   *Registry
 	alloc *Allocator
 	rep   *Replicator
+	auth  *Auth
 
 	heartbeatInterval time.Duration
 }
@@ -34,6 +37,12 @@ func NewServer(ns *Namespace, reg *Registry, alloc *Allocator, heartbeatInterval
 
 func (s *Server) AttachReplicator(rp *Replicator) {
 	s.rep = rp
+}
+
+// AttachAuth activa la autenticación y el aislamiento por usuario. Sin ella, el
+// servidor acepta todo (se usa en las pruebas unitarias).
+func (s *Server) AttachAuth(a *Auth) {
+	s.auth = a
 }
 
 // Heartbeat atiende el reporte de un DataNode y devuelve sus órdenes (RN-12).
@@ -56,6 +65,10 @@ func (s *Server) Heartbeat(ctx context.Context, report *pb.NodeReport) (*pb.Comm
 // Routes registra la API REST versionada por prefijo de ruta (RI-06).
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
+
+	// Autenticación (RQ-15, RQ-16): las únicas rutas de escritura sin token.
+	mux.HandleFunc("POST /v1/auth/register", s.handleRegister)
+	mux.HandleFunc("POST /v1/auth/login", s.handleLogin)
 
 	// Escritura: open -> allocate (N veces) -> commit. El commit va al final y es
 	// la única operación que publica algo.
@@ -80,7 +93,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("PUT /v1/config/replication", s.handleSetReplication)
 	mux.HandleFunc("GET /health", s.handleHealth)
 
-	return logging(mux)
+	// El registro va por fuera: así también quedan en el log los 401 del middleware.
+	return logging(s.auth.Middleware(mux))
 }
 
 // logging registra cada petición con su código y duración.
@@ -111,17 +125,73 @@ func (s *statusRecorder) WriteHeader(code int) {
 	s.ResponseWriter.WriteHeader(code)
 }
 
-// userOf identifica al solicitante.
-//
-// LIMITACIÓN DECLARADA DEL HITO 2: la identidad viaja en una cabecera y no se
-// verifica. La autenticación con Argon2id, JWT y ACL es del Hito 6 (RQ-15 a RQ-18).
-// La cabecera existe desde ahora para que el campo Owner del namespace se llene con
-// algo real y el modelo de propiedad no haya que retrofitearlo después.
+// userOf devuelve el usuario que el middleware verificó con el token. Ya no se lee
+// ninguna cabecera que el cliente pueda falsificar (RQ-15).
 func userOf(r *http.Request) string {
-	if u := r.Header.Get("X-DFSha-User"); u != "" {
+	if u, ok := r.Context().Value(userKey{}).(string); ok {
 		return u
 	}
 	return "anonymous"
+}
+
+// authorize exige que todas las rutas caigan dentro del home del solicitante (RX-13).
+func (s *Server) authorize(r *http.Request, paths ...string) error {
+	if s.auth == nil {
+		return nil
+	}
+	user := userOf(r)
+	for _, p := range paths {
+		if !canAccess(user, p) {
+			return fmt.Errorf("%w: %s está fuera de %s", ErrForbidden, p, homeOf(user))
+		}
+	}
+	return nil
+}
+
+// ---------- Autenticación ----------
+
+type credentials struct {
+	User     string `json:"user"`
+	Password string `json:"password"`
+}
+
+func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
+	var c credentials
+	if !decode(w, r, &c) {
+		return
+	}
+	if err := s.auth.Register(c.User, c.Password); err != nil {
+		fail(w, err)
+		return
+	}
+	// El home se crea al registrarse: es el único lugar donde el usuario puede escribir.
+	if _, err := s.ns.Mkdir("/home", "root"); err != nil && !errors.Is(err, ErrExists) {
+		fail(w, err)
+		return
+	}
+	if _, err := s.ns.Mkdir(homeOf(c.User), c.User); err != nil && !errors.Is(err, ErrExists) {
+		fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"user": c.User, "home": homeOf(c.User)})
+}
+
+func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	var c credentials
+	if !decode(w, r, &c) {
+		return
+	}
+	token, err := s.auth.Login(c.User, c.Password)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"token":      token,
+		"token_type": "Bearer",
+		"expires_in": int(s.auth.ttl.Seconds()),
+		"home":       homeOf(c.User),
+	})
 }
 
 // ---------- Escritura ----------
@@ -134,6 +204,10 @@ type openUploadRequest struct {
 func (s *Server) handleOpenUpload(w http.ResponseWriter, r *http.Request) {
 	var req openUploadRequest
 	if !decode(w, r, &req) {
+		return
+	}
+	if err := s.authorize(r, req.Path); err != nil {
+		fail(w, err)
 		return
 	}
 	up, err := s.alloc.OpenUpload(req.Path, userOf(r), req.Size, r.Header.Get("Idempotency-Key"))
@@ -221,6 +295,10 @@ func (s *Server) handleManifest(w http.ResponseWriter, r *http.Request) {
 		fail(w, ErrBadRequest)
 		return
 	}
+	if err := s.authorize(r, path); err != nil {
+		fail(w, err)
+		return
+	}
 	m, err := s.alloc.Manifest(path)
 	if err != nil {
 		fail(w, err)
@@ -268,13 +346,24 @@ func toEntry(i *types.Inode) entry {
 
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	path := queryPath(r)
+	if !onPathToHome(path) {
+		if err := s.authorize(r, path); err != nil {
+			fail(w, err)
+			return
+		}
+	}
 	children, err := s.ns.List(path)
 	if err != nil {
 		fail(w, err)
 		return
 	}
+	user := userOf(r)
 	entries := make([]entry, 0, len(children))
 	for _, c := range children {
+		// En "/" y "/home" solo se muestra el camino al home propio (RX-13).
+		if s.auth != nil && onPathToHome(path) && c.Name != "home" && c.Name != user {
+			continue
+		}
 		entries = append(entries, toEntry(c))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"path": path, "entries": entries})
@@ -285,6 +374,12 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 // distribuido un archivo entre los DataNodes.
 func (s *Server) handleStat(w http.ResponseWriter, r *http.Request) {
 	path := queryPath(r)
+	if !onPathToHome(path) {
+		if err := s.authorize(r, path); err != nil {
+			fail(w, err)
+			return
+		}
+	}
 	inode, err := s.ns.Stat(path)
 	if err != nil {
 		fail(w, err)
@@ -318,6 +413,10 @@ func (s *Server) handleMkdir(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
+	if err := s.authorize(r, req.Path); err != nil {
+		fail(w, err)
+		return
+	}
 	inode, err := s.ns.Mkdir(req.Path, userOf(r))
 	if err != nil {
 		fail(w, err)
@@ -328,6 +427,10 @@ func (s *Server) handleMkdir(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleRemove(w http.ResponseWriter, r *http.Request) {
 	path := queryPath(r)
+	if err := s.authorize(r, path); err != nil {
+		fail(w, err)
+		return
+	}
 	orphans, err := s.ns.Remove(path)
 	if err != nil {
 		fail(w, err)
@@ -345,6 +448,10 @@ type renameRequest struct {
 func (s *Server) handleRename(w http.ResponseWriter, r *http.Request) {
 	var req renameRequest
 	if !decode(w, r, &req) {
+		return
+	}
+	if err := s.authorize(r, req.From, req.To); err != nil {
+		fail(w, err)
 		return
 	}
 	if err := s.ns.Rename(req.From, req.To); err != nil {

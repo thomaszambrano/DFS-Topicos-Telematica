@@ -65,5 +65,5 @@ verify: ## Ejecuta la verificación completa del hito (E.2)
 	./scripts/verificar.sh
 
 .PHONY: shell
-shell: ## Abre la consola del cliente
-	cd client && python3 -m dfsha shell
+shell: ## Abre la consola del cliente (crea el usuario la primera vez)
+	cd client && python3 -m dfsha --register shell
